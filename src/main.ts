@@ -1,14 +1,19 @@
 import './style.css';
 import {
+  applyHostParticipants,
   applyHostelIncrease,
+  applySponsorBoost,
   calculateBudget,
   createDefaultBudgetInput,
   formatEur,
   formatSignedEur,
+  generateBoardExport,
+  generateFundingGapExport,
   sanitizeNonNegative,
   sanitizeNonNegativeInt,
   type BudgetInput,
   type BudgetInputKey,
+  type ExportTab,
 } from './budget.ts';
 
 interface FieldConfig {
@@ -27,10 +32,21 @@ const FIELD_CONFIGS: readonly FieldConfig[] = [
   {
     key: 'participants',
     label: 'Participants',
-    hint: 'Paying attendees',
+    hint: 'Incoming paying participants',
     group: 'scope',
     integer: true,
     sliderMax: 100,
+    sliderStep: 1,
+    inputStep: 1,
+    unit: 'people',
+  },
+  {
+    key: 'organizers',
+    label: 'Organizers',
+    hint: 'Local organizing team (meals only)',
+    group: 'scope',
+    integer: true,
+    sliderMax: 25,
     sliderStep: 1,
     inputStep: 1,
     unit: 'people',
@@ -57,9 +73,19 @@ const FIELD_CONFIGS: readonly FieldConfig[] = [
     unit: '€/person',
   },
   {
+    key: 'organizerFee',
+    label: "Organizers' Fee",
+    hint: '100% sure organizer contribution',
+    group: 'scope',
+    sliderMax: 150,
+    sliderStep: 1,
+    inputStep: 0.5,
+    unit: '€/org',
+  },
+  {
     key: 'hostelPerPersonNight',
     label: 'Hostel / person / night',
-    hint: 'Accommodation rate per bed-night',
+    hint: 'Accommodation for participants',
     group: 'costs',
     sliderMax: 60,
     sliderStep: 0.5,
@@ -69,7 +95,7 @@ const FIELD_CONFIGS: readonly FieldConfig[] = [
   {
     key: 'foodPerPersonDay',
     label: 'Food / person / day',
-    hint: 'Meals & catering per participant-day',
+    hint: 'Meals for participants + organizers',
     group: 'costs',
     sliderMax: 40,
     sliderStep: 0.5,
@@ -78,8 +104,8 @@ const FIELD_CONFIGS: readonly FieldConfig[] = [
   },
   {
     key: 'localTransportTotal',
-    label: 'Local transport total',
-    hint: 'Fixed group transit & bus passes',
+    label: 'Transportation total',
+    hint: 'Group transit & public transport',
     group: 'costs',
     sliderMax: 3000,
     sliderStep: 25,
@@ -97,14 +123,34 @@ const FIELD_CONFIGS: readonly FieldConfig[] = [
     unit: '€',
   },
   {
+    key: 'materialsTotal',
+    label: 'Materials total',
+    hint: 'Flipcharts, markers, badges & kits',
+    group: 'costs',
+    sliderMax: 1000,
+    sliderStep: 10,
+    inputStep: 1,
+    unit: '€',
+  },
+  {
+    key: 'unexpectedCostsPercent',
+    label: 'Unexpected Costs %',
+    hint: 'ESTIEM BPD recommends 3%–5% buffer',
+    group: 'costs',
+    sliderMax: 15,
+    sliderStep: 0.5,
+    inputStep: 0.5,
+    unit: '%',
+  },
+  {
     key: 'sponsorsAndGrants',
-    label: 'Sponsors & grants',
-    hint: 'External funding subtracted from costs',
+    label: 'Confirmed Sponsors & Grants',
+    hint: 'Only 100% sure external incomes',
     group: 'costs',
     sliderMax: 5000,
     sliderStep: 50,
     inputStep: 1,
-    unit: '€ credit',
+    unit: '€ sure',
   },
 ];
 
@@ -129,8 +175,36 @@ function el<K extends keyof HTMLElementTagNameMap>(
   return node;
 }
 
+async function copyText(text: string): Promise<boolean> {
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      // Fall through to legacy textarea copy
+    }
+  }
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.setAttribute('readonly', '');
+  textarea.style.position = 'fixed';
+  textarea.style.opacity = '0';
+  document.body.append(textarea);
+  textarea.select();
+  let copied = false;
+  try {
+    copied = document.execCommand('copy');
+  } finally {
+    textarea.remove();
+  }
+  return copied;
+}
+
 function mountApp(root: HTMLElement): void {
   let state: BudgetInput = createDefaultBudgetInput();
+  let activeExportTab: ExportTab = 'board';
+  let currentExportText = '';
+  let copyTimer: number | undefined;
   const controls = new Map<BudgetInputKey, ControlRefs>();
 
   const shell = el('div', 'app-shell');
@@ -144,16 +218,20 @@ function mountApp(root: HTMLElement): void {
     el(
       'p',
       'page-subtitle',
-      'Stress-test participant fees, accommodation rates, and sponsorship coverage in real time.',
+      'Aligned with ESTIEM Mastersheet 6. Budget & Event Organisation 101 (non-profit break-even, 100% sure incomes only).',
     ),
   );
 
   const actions = el('div', 'scenario-actions');
+  const hostBtn = el('button', 'btn btn-host', 'Host Participants (€0 Hostel)');
+  hostBtn.type = 'button';
+  const sponsorBtn = el('button', 'btn btn-sponsor', '+€500 Sponsor');
+  sponsorBtn.type = 'button';
   const hostelSpikeBtn = el('button', 'btn btn-scenario', 'Scenario: Hostel +25%');
   hostelSpikeBtn.type = 'button';
   const resetBtn = el('button', 'btn btn-reset', 'Reset Defaults');
   resetBtn.type = 'button';
-  actions.append(hostelSpikeBtn, resetBtn);
+  actions.append(hostBtn, sponsorBtn, hostelSpikeBtn, resetBtn);
   header.append(headerCopy, actions);
 
   // Status banner
@@ -177,10 +255,12 @@ function mountApp(root: HTMLElement): void {
   inputsCard.append(el('h2', 'card-title', 'Budget Parameters'));
 
   const scopeGroup = el('div', 'input-group');
-  scopeGroup.append(el('h3', 'group-heading', 'Event Scope & Target'));
+  scopeGroup.append(el('h3', 'group-heading', 'Event Scope & Fees'));
 
   const costsGroup = el('div', 'input-group');
-  costsGroup.append(el('h3', 'group-heading', 'Costs & Funding'));
+  costsGroup.append(
+    el('h3', 'group-heading', 'Mastersheet Expenses & Confirmed Income'),
+  );
 
   for (const cfg of FIELD_CONFIGS) {
     const row = el('div', 'control-row');
@@ -268,10 +348,10 @@ function mountApp(root: HTMLElement): void {
     return { tile, value, sub };
   };
 
-  const totalCostKpi = createKpiTile('Total Cost');
-  const netCostKpi = createKpiTile('Net Cost (after sponsors)');
-  const breakEvenKpi = createKpiTile('Break-Even Fee');
-  const surplusKpi = createKpiTile('Surplus / Deficit');
+  const totalCostKpi = createKpiTile('Total Expenses');
+  const netCostKpi = createKpiTile('Net Cost (Participant Share)');
+  const breakEvenKpi = createKpiTile('Break-Even Participant Fee');
+  const surplusKpi = createKpiTile('Non-Profit Balance');
 
   kpiGrid.append(
     totalCostKpi.tile,
@@ -280,16 +360,27 @@ function mountApp(root: HTMLElement): void {
     surplusKpi.tile,
   );
 
-  // Breakdown section
+  // Mastersheet Cost Breakdown section
   const breakdownSection = el('div', 'breakdown-section');
-  breakdownSection.append(el('h3', 'section-subtitle', 'Cost & Funding Breakdown'));
+  breakdownSection.append(
+    el('h3', 'section-subtitle', 'Mastersheet Cost Breakdown'),
+  );
 
   const stackedBar = el('div', 'stacked-bar');
-  const segHostel = el('div', 'bar-segment bar-hostel');
   const segFood = el('div', 'bar-segment bar-food');
-  const segTransport = el('div', 'bar-segment bar-transport');
+  const segAccommodation = el('div', 'bar-segment bar-accommodation');
   const segActivities = el('div', 'bar-segment bar-activities');
-  stackedBar.append(segHostel, segFood, segTransport, segActivities);
+  const segTransportation = el('div', 'bar-segment bar-transportation');
+  const segMaterials = el('div', 'bar-segment bar-materials');
+  const segUnexpected = el('div', 'bar-segment bar-unexpected');
+  stackedBar.append(
+    segFood,
+    segAccommodation,
+    segActivities,
+    segTransportation,
+    segMaterials,
+    segUnexpected,
+  );
 
   const breakdownList = el('ul', 'breakdown-list');
 
@@ -322,29 +413,90 @@ function mountApp(root: HTMLElement): void {
     return { formula, amount };
   };
 
-  const hostelRow = createBreakdownRow('Hostel', 'var(--seg-hostel)');
   const foodRow = createBreakdownRow('Food', 'var(--seg-food)');
-  const transportRow = createBreakdownRow(
-    'Local transport',
-    'var(--seg-transport)',
+  const accommodationRow = createBreakdownRow(
+    'Accommodation',
+    'var(--seg-accommodation)',
   );
-  const activitiesRow = createBreakdownRow(
-    'Activities / social',
-    'var(--seg-activities)',
+  const activitiesRow = createBreakdownRow('Activities', 'var(--seg-activities)');
+  const transportationRow = createBreakdownRow(
+    'Transportation',
+    'var(--seg-transportation)',
   );
-  const sponsorsRow = createBreakdownRow(
-    'Sponsors & grants',
+  const materialsRow = createBreakdownRow('Materials', 'var(--seg-materials)');
+  const unexpectedRow = createBreakdownRow(
+    'Unexpected Costs',
+    'var(--seg-unexpected)',
+  );
+
+  const participantRevenueRow = createBreakdownRow(
+    "Participants' Fee",
     undefined,
     'breakdown-row-divider',
     true,
   );
-  const revenueRow = createBreakdownRow('Target fee revenue');
+  const organizerRevenueRow = createBreakdownRow(
+    "Organizers' Fee",
+    undefined,
+    undefined,
+    true,
+  );
+  const sponsorsRow = createBreakdownRow(
+    'Confirmed Sponsors & Grants',
+    undefined,
+    undefined,
+    true,
+  );
+  const totalIncomeRow = createBreakdownRow(
+    'Total Confirmed Incomes',
+    undefined,
+    'breakdown-row-total',
+    true,
+  );
 
   breakdownSection.append(stackedBar, breakdownList);
   summaryCard.append(kpiGrid, breakdownSection);
 
   grid.append(inputsCard, summaryCard);
-  shell.append(header, statusBanner, grid);
+
+  // Full-width Export Summary card
+  const exportCard = el('section', 'card export-card');
+  const exportHeader = el('div', 'export-header');
+  const exportTitleGroup = el('div', 'export-title-group');
+  exportTitleGroup.append(
+    el('h2', 'card-title', 'Export Summary'),
+    el(
+      'p',
+      'export-caption',
+      'Per ESTIEM Event Organisation 101: use Break-Even for your Board/Members and Funding Gap to pitch your University or Sponsors.',
+    ),
+  );
+
+  const exportControls = el('div', 'export-controls');
+  const tabList = el('div', 'export-tabs');
+  tabList.setAttribute('role', 'tablist');
+  tabList.setAttribute('aria-label', 'Export summary version');
+
+  const boardTabBtn = el('button', 'export-tab', 'Break-Even (Board)');
+  boardTabBtn.type = 'button';
+  boardTabBtn.setAttribute('role', 'tab');
+
+  const gapTabBtn = el('button', 'export-tab', 'Funding Gap (Uni / Sponsor)');
+  gapTabBtn.type = 'button';
+  gapTabBtn.setAttribute('role', 'tab');
+
+  tabList.append(boardTabBtn, gapTabBtn);
+
+  const copyBtn = el('button', 'btn btn-copy', 'Copy Summary');
+  copyBtn.type = 'button';
+
+  exportControls.append(tabList, copyBtn);
+  exportHeader.append(exportTitleGroup, exportControls);
+
+  const exportPreview = el('pre', 'export-preview');
+  exportCard.append(exportHeader, exportPreview);
+
+  shell.append(header, statusBanner, grid, exportCard);
   root.replaceChildren(shell);
 
   const syncControlsFromState = (): void => {
@@ -366,18 +518,18 @@ function mountApp(root: HTMLElement): void {
     statusDetail.textContent = status.detail;
     statusMarginPill.textContent =
       result.marginPercent === null
-        ? 'No costs entered'
-        : `Margin: ${result.marginPercent >= 0 ? '+' : ''}${result.marginPercent.toFixed(1)}%`;
+        ? 'No expenses entered'
+        : `Balance: ${result.marginPercent >= 0 ? '+' : ''}${result.marginPercent.toFixed(1)}%`;
 
     // KPI tiles
     totalCostKpi.value.textContent = formatEur(result.totalCost);
     totalCostKpi.sub.textContent =
       input.participants > 0
-        ? `${formatEur(result.totalCost / input.participants)} gross / person`
-        : 'Fixed + variable costs';
+        ? `${formatEur(result.totalCost / input.participants)} gross / participant`
+        : 'Includes unexpected buffer';
 
     netCostKpi.value.textContent = formatEur(result.netCost);
-    netCostKpi.sub.textContent = `After ${formatEur(breakdown.sponsorsOffset)} sponsors`;
+    netCostKpi.sub.textContent = `After ${formatEur(breakdown.sponsorsIncome + breakdown.organizerFeeIncome)} sponsors + org fees`;
 
     if (result.breakEvenFee === null) {
       breakEvenKpi.value.textContent = 'N/A';
@@ -398,40 +550,86 @@ function mountApp(root: HTMLElement): void {
     surplusKpi.value.textContent = formatSignedEur(result.surplusDeficit);
     surplusKpi.sub.textContent =
       result.surplusDeficitPerParticipant === null
-        ? 'No fee revenue at 0 participants'
+        ? 'No participant fee revenue'
         : `${formatSignedEur(result.surplusDeficitPerParticipant)} / participant`;
 
-    // Stacked bar proportions
+    // Mastersheet 6-segment bar proportions
     const costBase = result.totalCost;
     const pct = (part: number): string =>
       costBase > 0 ? `${(part / costBase) * 100}%` : '0%';
-    segHostel.style.width = pct(breakdown.hostelCost);
     segFood.style.width = pct(breakdown.foodCost);
-    segTransport.style.width = pct(breakdown.transportCost);
+    segAccommodation.style.width = pct(breakdown.accommodationCost);
     segActivities.style.width = pct(breakdown.activitiesCost);
+    segTransportation.style.width = pct(breakdown.transportationCost);
+    segMaterials.style.width = pct(breakdown.materialsCost);
+    segUnexpected.style.width = pct(breakdown.unexpectedCosts);
 
-    // Itemized breakdown
-    hostelRow.formula.textContent = `(${input.participants} × ${input.nights} × ${formatEur(input.hostelPerPersonNight)})`;
-    hostelRow.amount.textContent = formatEur(breakdown.hostelCost);
-
-    foodRow.formula.textContent = `(${input.participants} × ${input.nights} × ${formatEur(input.foodPerPersonDay)})`;
+    // Itemized Mastersheet expenses & confirmed incomes
+    const mealPeople = input.participants + input.organizers;
+    foodRow.formula.textContent = `(${mealPeople} ppl × ${input.nights} × ${formatEur(input.foodPerPersonDay)})`;
     foodRow.amount.textContent = formatEur(breakdown.foodCost);
 
-    transportRow.formula.textContent = '(fixed)';
-    transportRow.amount.textContent = formatEur(breakdown.transportCost);
+    accommodationRow.formula.textContent = `(${input.participants} pax × ${input.nights} × ${formatEur(input.hostelPerPersonNight)})`;
+    accommodationRow.amount.textContent = formatEur(breakdown.accommodationCost);
 
     activitiesRow.formula.textContent = '(fixed)';
     activitiesRow.amount.textContent = formatEur(breakdown.activitiesCost);
 
-    sponsorsRow.formula.textContent = '(subtracted from costs)';
-    sponsorsRow.amount.textContent =
-      breakdown.sponsorsOffset > 0
-        ? `-${formatEur(breakdown.sponsorsOffset)}`
-        : formatEur(0);
+    transportationRow.formula.textContent = '(fixed)';
+    transportationRow.amount.textContent = formatEur(
+      breakdown.transportationCost,
+    );
 
-    revenueRow.formula.textContent = `(${input.participants} × ${formatEur(input.targetFee)})`;
-    revenueRow.amount.textContent = formatEur(breakdown.feeRevenue);
+    materialsRow.formula.textContent = '(fixed)';
+    materialsRow.amount.textContent = formatEur(breakdown.materialsCost);
+
+    unexpectedRow.formula.textContent = `(${input.unexpectedCostsPercent}% of ${formatEur(breakdown.baseExpensesSubtotal)})`;
+    unexpectedRow.amount.textContent = formatEur(breakdown.unexpectedCosts);
+
+    participantRevenueRow.formula.textContent = `(${input.participants} × ${formatEur(input.targetFee)})`;
+    participantRevenueRow.amount.textContent = formatEur(
+      breakdown.participantFeeIncome,
+    );
+
+    organizerRevenueRow.formula.textContent = `(${input.organizers} × ${formatEur(input.organizerFee)})`;
+    organizerRevenueRow.amount.textContent = formatEur(
+      breakdown.organizerFeeIncome,
+    );
+
+    sponsorsRow.formula.textContent = '(100% sure)';
+    sponsorsRow.amount.textContent = formatEur(breakdown.sponsorsIncome);
+
+    totalIncomeRow.formula.textContent = '';
+    totalIncomeRow.amount.textContent = formatEur(breakdown.totalConfirmedIncome);
+
+    // Export Summary tabs & preview
+    boardTabBtn.setAttribute(
+      'aria-selected',
+      activeExportTab === 'board' ? 'true' : 'false',
+    );
+    gapTabBtn.setAttribute(
+      'aria-selected',
+      activeExportTab === 'funding-gap' ? 'true' : 'false',
+    );
+
+    currentExportText =
+      activeExportTab === 'board'
+        ? generateBoardExport(result)
+        : generateFundingGapExport(result);
+    exportPreview.textContent = currentExportText;
   };
+
+  hostBtn.addEventListener('click', () => {
+    state = applyHostParticipants(state);
+    syncControlsFromState();
+    render();
+  });
+
+  sponsorBtn.addEventListener('click', () => {
+    state = applySponsorBoost(state, 500);
+    syncControlsFromState();
+    render();
+  });
 
   hostelSpikeBtn.addEventListener('click', () => {
     state = applyHostelIncrease(state, 25);
@@ -443,6 +641,34 @@ function mountApp(root: HTMLElement): void {
     state = createDefaultBudgetInput();
     syncControlsFromState();
     render();
+  });
+
+  boardTabBtn.addEventListener('click', () => {
+    activeExportTab = 'board';
+    render();
+  });
+
+  gapTabBtn.addEventListener('click', () => {
+    activeExportTab = 'funding-gap';
+    render();
+  });
+
+  copyBtn.addEventListener('click', () => {
+    void copyText(currentExportText).then((copied) => {
+      if (!copied) {
+        return;
+      }
+      copyBtn.textContent = 'Copied!';
+      copyBtn.classList.add('is-copied');
+      if (copyTimer !== undefined) {
+        window.clearTimeout(copyTimer);
+      }
+      copyTimer = window.setTimeout(() => {
+        copyBtn.textContent = 'Copy Summary';
+        copyBtn.classList.remove('is-copied');
+        copyTimer = undefined;
+      }, 1800);
+    });
   });
 
   syncControlsFromState();
