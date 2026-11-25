@@ -15,6 +15,7 @@ import {
   type BudgetInputKey,
   type ExportTab,
 } from './budget.ts';
+import { renderBreakEvenChart } from './chart.ts';
 
 interface FieldConfig {
   key: BudgetInputKey;
@@ -360,6 +361,52 @@ function mountApp(root: HTMLElement): void {
     surplusKpi.tile,
   );
 
+  // Break-Even & Fixed-vs-Variable SVG Chart section
+  const chartSection = el('div', 'chart-section');
+  const chartHeader = el('div', 'chart-header');
+  chartHeader.append(
+    el('h3', 'section-subtitle', 'Break-Even & Cost Behavior'),
+  );
+
+  const chartLegend = el('div', 'chart-legend');
+  const addLegendItem = (swatchClass: string, label: string): void => {
+    const item = el('span', 'legend-item');
+    item.append(el('span', `legend-swatch ${swatchClass}`), document.createTextNode(label));
+    chartLegend.append(item);
+  };
+  addLegendItem('swatch-income', 'Incomes');
+  addLegendItem('swatch-expense', 'Expenses');
+  addLegendItem('swatch-fixed', 'Fixed');
+  addLegendItem('swatch-breakeven', 'Break-Even');
+  chartHeader.append(chartLegend);
+
+  const chartSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  chartSvg.setAttribute('class', 'breakeven-svg');
+  chartSvg.setAttribute('viewBox', '0 0 460 225');
+  chartSvg.setAttribute('role', 'img');
+
+  const chartMetrics = el('div', 'chart-metrics');
+  const createMetricChip = (
+    labelText: string,
+  ): { chip: HTMLDivElement; value: HTMLSpanElement } => {
+    const chip = el('div', 'chart-metric-chip');
+    const label = el('span', 'chart-metric-label', labelText);
+    const value = el('span', 'chart-metric-value');
+    chip.append(label, value);
+    return { chip, value };
+  };
+
+  const fixedMetric = createMetricChip('Fixed Costs');
+  const variableMetric = createMetricChip('Variable / Participant');
+  const breakEvenHeadcountMetric = createMetricChip('Break-Even Headcount');
+  chartMetrics.append(
+    fixedMetric.chip,
+    variableMetric.chip,
+    breakEvenHeadcountMetric.chip,
+  );
+
+  chartSection.append(chartHeader, chartSvg, chartMetrics);
+
   // Mastersheet Cost Breakdown section
   const breakdownSection = el('div', 'breakdown-section');
   breakdownSection.append(
@@ -455,7 +502,7 @@ function mountApp(root: HTMLElement): void {
   );
 
   breakdownSection.append(stackedBar, breakdownList);
-  summaryCard.append(kpiGrid, breakdownSection);
+  summaryCard.append(kpiGrid, chartSection, breakdownSection);
 
   grid.append(inputsCard, summaryCard);
 
@@ -552,6 +599,21 @@ function mountApp(root: HTMLElement): void {
       result.surplusDeficitPerParticipant === null
         ? 'No participant fee revenue'
         : `${formatSignedEur(result.surplusDeficitPerParticipant)} / participant`;
+
+    // Inline SVG Break-Even & Cost Behavior chart
+    renderBreakEvenChart(chartSvg, result);
+    const { costStructure } = result;
+    fixedMetric.value.textContent = formatEur(costStructure.fixedCosts);
+    variableMetric.value.textContent = formatEur(
+      costStructure.variableCostPerParticipant,
+    );
+    if (costStructure.breakEvenParticipants === null) {
+      breakEvenHeadcountMetric.value.textContent = 'Fee ≤ variable cost';
+    } else if (costStructure.breakEvenParticipants === 0) {
+      breakEvenHeadcountMetric.value.textContent = '0 pax (covered)';
+    } else {
+      breakEvenHeadcountMetric.value.textContent = `${Math.ceil(costStructure.breakEvenParticipants)} pax`;
+    }
 
     // Mastersheet 6-segment bar proportions
     const costBase = result.totalCost;

@@ -1,4 +1,4 @@
-export interface BudgetInput {
+﻿export interface BudgetInput {
   participants: number;
   organizers: number;
   nights: number;
@@ -40,9 +40,20 @@ export interface BudgetBreakdown {
   totalConfirmedIncome: number;
 }
 
+export interface CostStructure {
+  fixedCosts: number;
+  variableCostPerParticipant: number;
+  variableCosts: number;
+  fixedIncome: number;
+  incomePerParticipant: number;
+  contributionPerParticipant: number;
+  breakEvenParticipants: number | null;
+}
+
 export interface BudgetResult {
   input: BudgetInput;
   breakdown: BudgetBreakdown;
+  costStructure: CostStructure;
   totalCost: number;
   netCost: number;
   breakEvenFee: number | null;
@@ -244,6 +255,37 @@ export function calculateBudget(rawInput: BudgetInput): BudgetResult {
     Math.max(0, totalCost - totalConfirmedIncome),
   );
 
+  const bufferMultiplier = 1 + input.unexpectedCostsPercent / 100;
+  const organizerFoodBase =
+    input.organizers * input.nights * input.foodPerPersonDay;
+  const fixedBaseExpenses =
+    activitiesCost + transportationCost + materialsCost + organizerFoodBase;
+  const fixedCosts = normalizeZero(fixedBaseExpenses * bufferMultiplier);
+  const variableBasePerParticipant =
+    input.nights * (input.hostelPerPersonNight + input.foodPerPersonDay);
+  const variableCostPerParticipant = normalizeZero(
+    variableBasePerParticipant * bufferMultiplier,
+  );
+  const variableCosts = normalizeZero(
+    input.participants * variableCostPerParticipant,
+  );
+
+  const fixedIncome = normalizeZero(organizerFeeIncome + sponsorsIncome);
+  const incomePerParticipant = normalizeZero(input.targetFee);
+  const contributionPerParticipant = normalizeZero(
+    incomePerParticipant - variableCostPerParticipant,
+  );
+  const netFixedGap = fixedCosts - fixedIncome;
+
+  let breakEvenParticipants: number | null = null;
+  if (netFixedGap <= 1e-9 && contributionPerParticipant >= -1e-9) {
+    breakEvenParticipants = 0;
+  } else if (netFixedGap > 1e-9 && contributionPerParticipant > 1e-9) {
+    breakEvenParticipants = normalizeZero(
+      netFixedGap / contributionPerParticipant,
+    );
+  }
+
   const status = evaluateStatus(
     input,
     totalCost,
@@ -266,6 +308,15 @@ export function calculateBudget(rawInput: BudgetInput): BudgetResult {
       organizerFeeIncome,
       sponsorsIncome,
       totalConfirmedIncome,
+    },
+    costStructure: {
+      fixedCosts,
+      variableCostPerParticipant,
+      variableCosts,
+      fixedIncome,
+      incomePerParticipant,
+      contributionPerParticipant,
+      breakEvenParticipants,
     },
     totalCost,
     netCost,
